@@ -26,6 +26,9 @@ import { z } from "npm:zod@4";
 /** Label holding the hash of the spec that created a container. */
 export const SPEC_LABEL = "swamp.apple-container.spec";
 
+/** Label marking the stopped copy `ensure` creates to validate a replacement. */
+export const STAGING_LABEL = "swamp.apple-container.staging";
+
 const MAX_OUTPUT = 64 * 1024;
 const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}$/;
 const VOLUME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/;
@@ -61,23 +64,36 @@ export type Runner = (
   opts: RunOptions,
 ) => Promise<RunResult>;
 
-/** Run the real CLI. No shell is involved. */
+/** A call that was stopped before it finished. */
+export class Interrupted extends Error {
+  /** `true` when the CLI ended on SIGTERM, which it forwards to the command. */
+  readonly graceful: boolean;
+  /** Build the error from what stopped the call and how it ended. */
+  constructor(message: string, graceful: boolean) {
+    super(message);
+    this.name = "Interrupted";
+    this.graceful = graceful;
+  }
+}
+
+const KILL_GRACE_MS = 5_000;
+
+/**
+ * Run the real CLI. No shell is involved. On timeout or cancellation it gets
+ * SIGTERM, which it forwards to the command it runs, then SIGKILL.
+ */
 export const spawnRunner: Runner = async (binary, args, opts) => {
-  const timeout = AbortSignal.timeout(opts.timeoutMs);
-  const signal = opts.signal
-    ? AbortSignal.any([opts.signal, timeout])
-    : timeout;
-  let out: Deno.CommandOutput;
+  opts.signal?.throwIfAborted();
+  let child: Deno.ChildProcess;
   try {
     // swamp-quality-ignore deno-command
-    out = await new Deno.Command(binary, {
+    child = new Deno.Command(binary, {
       args,
       env: opts.env,
       stdin: "null",
       stdout: "piped",
       stderr: "piped",
-      signal,
-    }).output();
+    }).spawn();
   } catch (error) {
     if (error instanceof Deno.errors.NotFound) {
       throw new Error(
@@ -87,18 +103,44 @@ export const spawnRunner: Runner = async (binary, args, opts) => {
     }
     throw error;
   }
-  if (signal.aborted) {
-    throw new Error(
-      timeout.aborted
-        ? `container ${args[0]} timed out after ${opts.timeoutMs} ms`
-        : `container ${args[0]} was cancelled`,
-    );
-  }
-  return {
-    code: out.code,
-    stdout: new TextDecoder().decode(out.stdout),
-    stderr: new TextDecoder().decode(out.stderr),
+  let why = "";
+  let killed = false;
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  const send = (sig: Deno.Signal) => {
+    try {
+      child.kill(sig);
+    } catch {
+      // Already gone.
+    }
   };
+  const interrupt = (reason: string) => {
+    if (why) return;
+    why = reason;
+    send("SIGTERM");
+    killTimer = setTimeout(() => {
+      killed = true;
+      send("SIGKILL");
+    }, KILL_GRACE_MS);
+  };
+  const timer = setTimeout(
+    () => interrupt(`timed out after ${opts.timeoutMs} ms`),
+    opts.timeoutMs,
+  );
+  const onAbort = () => interrupt("was cancelled");
+  opts.signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    const out = await child.output();
+    if (why) throw new Interrupted(`container ${args[0]} ${why}`, !killed);
+    return {
+      code: out.code,
+      stdout: new TextDecoder().decode(out.stdout),
+      stderr: new TextDecoder().decode(out.stderr),
+    };
+  } finally {
+    clearTimeout(timer);
+    clearTimeout(killTimer);
+    opts.signal?.removeEventListener("abort", onAbort);
+  }
 };
 
 let runner: Runner = spawnRunner;
@@ -218,6 +260,30 @@ export function parseContainers(stdout: string): ContainerRow[] {
       startedAt: str(s.startedDate),
     };
   }).sort((a, b) => a.id.localeCompare(b.id));
+}
+
+/**
+ * Whether a container's secret environment differs from what is wanted.
+ * Compared in memory: neither side is returned, hashed or stored.
+ */
+export function secretsDiffer(
+  stdout: string,
+  id: string,
+  want: Record<string, string>,
+): boolean {
+  const r = parseArray(stdout, "list").find((x) => x.id === id);
+  const env = obj(obj(obj(r).configuration).initProcess).environment;
+  if (!Array.isArray(env)) {
+    throw new Error(`container list: ${id} has no environment`);
+  }
+  const have = new Set(env);
+  return Object.entries(want).some(([k, v]) => !have.has(`${k}=${v}`));
+}
+
+/** The container a staging copy belongs to, or null when it is not one. */
+export function stagingFor(stdout: string, id: string): string | null {
+  const r = parseArray(stdout, "list").find((x) => x.id === id);
+  return str(obj(obj(obj(r).configuration).labels)[STAGING_LABEL]);
 }
 
 /** Parse `container image list --format=json`. */
@@ -373,7 +439,9 @@ const SpecShape = {
   ports: z.array(line).default([]).describe(
     "[host-ip:]host-port:container-port[/protocol]",
   ),
-  volumes: z.array(line).default([]).describe("source:target[:ro]"),
+  volumes: z.array(
+    line.regex(/^[^:]+:./, "must be source:target; no anonymous volumes"),
+  ).default([]).describe("source:target[:ro]"),
   networks: z.array(line).default([]).describe("name[,mac=..][,alias=..]"),
   cpus: z.number().int().positive().optional(),
   memory: z.string().regex(/^\d+[KMGTPkmgtp]?$/).optional().describe(
@@ -423,8 +491,17 @@ export async function specHash(spec: ContainerSpec): Promise<string> {
  * Arguments for `container create`. Options use the joined `--opt=value` form
  * so a value starting with `-` cannot be read as another option.
  */
-export function createArgs(spec: ContainerSpec, hash: string): string[] {
-  const a = ["create", `--name=${spec.name}`, `--label=${SPEC_LABEL}=${hash}`];
+export function createArgs(
+  spec: ContainerSpec,
+  hash: string,
+  stagingName?: string,
+): string[] {
+  const a = [
+    "create",
+    `--name=${stagingName ?? spec.name}`,
+    `--label=${SPEC_LABEL}=${hash}`,
+  ];
+  if (stagingName) a.push(`--label=${STAGING_LABEL}=${spec.name}`);
   for (const [k, v] of sortKeys(spec.env)) a.push(`--env=${k}=${v}`);
   for (const k of Object.keys(spec.secretEnv).sort()) a.push(`--env=${k}`);
   for (const p of spec.ports) a.push(`--publish=${p}`);
@@ -501,8 +578,8 @@ async function must(
   return r.stdout;
 }
 
-const listAll = async (ctx: Context) =>
-  parseContainers(await must(ctx, ["list", "--all", "--format=json"]));
+const listRaw = (ctx: Context) => must(ctx, ["list", "--all", "--format=json"]);
+const listAll = async (ctx: Context) => parseContainers(await listRaw(ctx));
 
 async function find(ctx: Context, id: string): Promise<ContainerRow | null> {
   return (await listAll(ctx)).find((c) => c.id === id) ?? null;
@@ -543,6 +620,80 @@ async function stopIfUp(ctx: Context, row: ContainerRow, seconds: number) {
 async function deleteRow(ctx: Context, id: string) {
   await must(ctx, ["delete", id]);
   if (await find(ctx, id)) throw new Error(`${id} still exists after delete`);
+}
+
+/** Data instance name for an image: readable, and unique per reference. */
+export async function imageInstance(image: string): Promise<string> {
+  const digest = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", new TextEncoder().encode(image)),
+  );
+  const hex = [...digest.slice(0, 6)].map((b) =>
+    b.toString(16).padStart(2, "0")
+  ).join("");
+  return `${image.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 80)}-${hex}`;
+}
+
+/** Name of the staging copy: within the CLI's 63 characters, and stable. */
+export function stagingName(id: string): string {
+  return `${id.slice(0, 50)}.swampstage`;
+}
+
+/**
+ * Prove a replacement can be created, image and all, while the container it
+ * will replace still exists. The CLI cannot rename, so the copy is deleted.
+ */
+async function rehearse(ctx: Context, spec: ContainerSpec, hash: string) {
+  const id = stagingName(spec.name);
+  const clear = async () => {
+    const out = await listRaw(ctx);
+    const row = parseContainers(out).find((c) => c.id === id);
+    if (!row) return;
+    if (stagingFor(out, id) !== spec.name || row.state !== "stopped") {
+      throw new Error(`${id} exists and is not a stopped staging copy`);
+    }
+    await deleteRow(ctx, id);
+  };
+  await clear(); // left by an interrupted run
+  await must(ctx, createArgs(spec, hash, id), {
+    secrets: spec.secretEnv,
+    slow: true,
+  });
+  await clear();
+}
+
+/**
+ * Whether a failed `container exec` is the CLI's own failure to start the
+ * command, rather than the command exiting non-zero.
+ */
+export function isExecCliError(r: RunResult): boolean {
+  return (r.code === 1 &&
+    /^Error: failed to start process [0-9a-f-]{36} in container /m.test(
+      r.stderr,
+    )) || (r.code === 64 && r.stderr.includes("Usage: container exec"));
+}
+
+const EXEC_ID = "SWAMP_EXEC_ID";
+/** Kills every process carrying the marker; prints how many remain. */
+const REAP = "for s in 1 2 3; do n=0; for p in /proc/[0-9]*; do " +
+  'if grep -q "$1" "$p/environ" 2>/dev/null && kill -9 "${p#/proc/}" 2>/dev/null; ' +
+  "then n=$((n+1)); fi; done; [ $n = 0 ] && break; sleep 1; done; echo left=$n";
+
+/** Stop what a forcibly ended exec left behind, and say whether that worked. */
+async function reap(ctx: Context, id: string, marker: string): Promise<string> {
+  try {
+    // Not the run's signal: it may be the reason we are here.
+    const r = await runner(
+      ctx.globalArgs.binary,
+      ["exec", "--user=0", id, "sh", "-c", REAP, "sh", `${EXEC_ID}=${marker}`],
+      { timeoutMs: 20_000 },
+    );
+    if (r.code === 0 && r.stdout.trim() === "left=0") {
+      return "the command ignored SIGTERM and was killed";
+    }
+  } catch {
+    // Reported below.
+  }
+  return `the command ignored SIGTERM and could not be killed; it may still run in ${id}. Stop the container to end it`;
 }
 
 // ---------------------------------------------------------------------------
@@ -663,7 +814,6 @@ const PruneSchema = z.object({
   dryRun: z.boolean(),
   candidates: z.array(z.string()),
   deleted: z.array(z.string()),
-  failed: z.array(z.object({ id: z.string(), error: z.string() })),
   timestamp: z.string(),
 });
 
@@ -900,7 +1050,7 @@ export const model = {
         "Create and start a container, or do nothing when it already matches. Refuses a container it did not create. A drifted one is replaced only when asked.",
       arguments: SpecSchema.extend({
         replace: z.enum(["never", "drift", "always"]).default("never").describe(
-          "Whether to stop, delete and recreate a managed container: never, when its spec changed, or every time (use after rotating a secret, whose value is not compared).",
+          "Whether to recreate a managed container: never, when its spec or a secret changed, or every time. The replacement is created once as a check before the old one is deleted.",
         ),
         settleSeconds: z.number().nonnegative().max(300).default(2).describe(
           "Wait this long after start, then require it still runs.",
@@ -917,19 +1067,24 @@ export const model = {
       ) => {
         const { replace, settleSeconds, stopSeconds, ...spec } = args;
         const hash = await specHash(spec);
-        let row = await find(ctx, spec.name);
+        const listing = await listRaw(ctx);
+        let row = parseContainers(listing).find((c) => c.id === spec.name) ??
+          null;
         let action = "unchanged";
         if (row && !row.managed) {
           throw new Error(
             `${spec.name} exists and was not created by this model; not touching it`,
           );
         }
-        if (row && (row.specHash !== hash || replace === "always")) {
+        const drifted = row !== null && (row.specHash !== hash ||
+          secretsDiffer(listing, spec.name, spec.secretEnv));
+        if (row && (drifted || replace === "always")) {
           if (replace === "never") {
             throw new Error(
               `${spec.name} differs from the requested spec. Set replace=drift to recreate it (its root filesystem is lost).`,
             );
           }
+          await rehearse(ctx, spec, hash);
           await stopIfUp(ctx, row, stopSeconds);
           await deleteRow(ctx, spec.name);
           row = null;
@@ -1055,17 +1210,45 @@ export const model = {
         if (row?.state !== "running") {
           throw new Error(`${args.name} is ${row?.state ?? "absent"}`);
         }
-        const a = ["exec"];
+        const marker = crypto.randomUUID();
+        const a = ["exec", `--env=${EXEC_ID}=${marker}`];
         for (const k of Object.keys(args.secretEnv).sort()) {
           a.push(`--env=${k}`);
         }
         if (args.user) a.push(`--user=${args.user}`);
         if (args.workdir) a.push(`--workdir=${args.workdir}`);
         a.push(args.name, ...args.command);
-        const r = await raw(ctx, a, { secrets: args.secretEnv });
         const secrets = Object.values(args.secretEnv);
+        let r: RunResult;
+        try {
+          r = await raw(ctx, a, { secrets: args.secretEnv });
+        } catch (error) {
+          if (error instanceof Interrupted && !error.graceful) {
+            throw new Error(
+              `${error.message}; ${await reap(ctx, args.name, marker)}`,
+            );
+          }
+          throw error;
+        }
         const out = tail(redact(r.stdout, secrets));
         const err = tail(redact(r.stderr, secrets));
+        if (r.code !== 0) {
+          const still = await find(ctx, args.name);
+          if (isExecCliError(r) || still?.state !== "running") {
+            throw new Error(
+              `could not run the command in ${args.name} (${
+                still?.state ?? "absent"
+              }): ${err.text.trim().slice(0, 400)}`,
+            );
+          }
+          if (!args.allowFailure) {
+            throw new Error(
+              `command in ${args.name} exited ${r.code}; set allowFailure to record it. stderr: ${
+                err.text.trim().slice(-2000)
+              } stdout: ${out.text.trim().slice(-2000)}`,
+            );
+          }
+        }
         await ctx.writeResource("output", `exec-${args.name}`, {
           name: args.name,
           exitCode: r.code,
@@ -1074,13 +1257,6 @@ export const model = {
           truncated: out.truncated || err.truncated,
           timestamp: now(),
         });
-        if (r.code !== 0 && !args.allowFailure) {
-          throw new Error(
-            `command in ${args.name} exited ${r.code}: ${
-              err.text.trim().slice(-400)
-            }`,
-          );
-        }
       }),
     },
     logs: {
@@ -1148,7 +1324,7 @@ export const model = {
         await record(
           ctx,
           "image",
-          args.image.replace(/[^A-Za-z0-9._-]/g, "-"),
+          await imageInstance(args.image),
           "pulled",
           true,
         );
@@ -1303,18 +1479,19 @@ export const model = {
             });
           }
         }
+        if (failed.length) {
+          throw new Error(
+            `deleted [${deleted.join(", ")}]; could not delete ${
+              failed.map((f) => `${f.id} (${f.error})`).join(", ")
+            }`,
+          );
+        }
         await ctx.writeResource("prune", "containers", {
           dryRun: !args.apply,
           candidates,
           deleted,
-          failed,
           timestamp: now(),
         });
-        if (failed.length) {
-          throw new Error(
-            `could not delete ${failed.map((f) => f.id).join(", ")}`,
-          );
-        }
       }),
     },
   },

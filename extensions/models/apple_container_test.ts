@@ -9,6 +9,9 @@ import {
 import { z } from "npm:zod@4";
 import {
   createArgs,
+  imageInstance,
+  Interrupted,
+  isExecCliError,
   model,
   parseArray,
   parseContainers,
@@ -19,8 +22,11 @@ import {
   type RunOptions,
   type RunResult,
   setRunner,
+  spawnRunner,
   SPEC_LABEL,
   specHash,
+  STAGING_LABEL,
+  stagingName,
   tail,
 } from "./apple_container.ts";
 
@@ -29,6 +35,8 @@ import {
 interface Fake {
   state: string;
   hash?: string;
+  env?: string[];
+  staging?: string;
 }
 interface Call {
   args: string[];
@@ -44,11 +52,15 @@ function row(id: string, f: Fake) {
     configuration: {
       id,
       image: { reference: "docker.io/library/alpine:latest", descriptor: {} },
-      labels: { private: SECRET, ...(f.hash ? { [SPEC_LABEL]: f.hash } : {}) },
+      labels: {
+        private: SECRET,
+        ...(f.hash ? { [SPEC_LABEL]: f.hash } : {}),
+        ...(f.staging ? { [STAGING_LABEL]: f.staging } : {}),
+      },
       initProcess: {
         executable: "/bin/sh",
         arguments: ["--token", SECRET],
-        environment: [`TOKEN=${SECRET}`],
+        environment: f.env ?? [`TOKEN=${SECRET}`],
       },
       publishedPorts: [{
         hostAddress: "127.0.0.1",
@@ -86,9 +98,10 @@ class Cli {
 
   run = (_b: string, args: string[], opts: RunOptions): Promise<RunResult> => {
     this.calls.push({ args, opts });
-    return Promise.resolve(this.answer(args));
+    return Promise.resolve().then(() => this.answer(args, opts));
   };
-  answer(args: string[]): RunResult {
+  failCreate = false;
+  answer(args: string[], opts?: RunOptions): RunResult {
     const ok = (stdout = ""): RunResult => ({ code: 0, stdout, stderr: "" });
     const bad = (stderr: string): RunResult => ({
       code: 1,
@@ -134,12 +147,19 @@ class Cli {
           JSON.stringify([...this.containers].map(([k, v]) => row(k, v))),
         );
       case "create": {
+        if (this.failCreate) return bad("manifest not found");
         const id = args.find((a) => a.startsWith("--name="))!.slice(7);
         const prefix = `--label=${SPEC_LABEL}=`;
         const hash = args.find((a) => a.startsWith(prefix))!.slice(
           prefix.length,
         );
-        this.containers.set(id, { state: "stopped", hash });
+        const sp = `--label=${STAGING_LABEL}=`;
+        this.containers.set(id, {
+          state: "stopped",
+          hash,
+          env: Object.entries(opts?.env ?? {}).map(([k, v]) => `${k}=${v}`),
+          staging: args.find((a) => a.startsWith(sp))?.slice(sp.length),
+        });
         return ok(id);
       }
       case "start":
@@ -373,10 +393,10 @@ Deno.test("ensure fails when the container dies after start", async () => {
 Deno.test("a CLI error redacts secrets", async () => {
   const cli = new Cli();
   const answer = cli.answer.bind(cli);
-  cli.answer = (a) =>
+  cli.answer = (a, o) =>
     a[0] === "create"
       ? { code: 1, stdout: "", stderr: `bad ${SECRET}` }
-      : answer(a);
+      : answer(a, o);
   const e = await assertRejects(
     () => run(cli, "ensure", { ...SPEC, secretEnv: { T: SECRET } }),
     Error,
@@ -427,7 +447,67 @@ Deno.test("prune reports a failed delete", async () => {
   const cli = new Cli();
   cli.containers.set("old", { state: "stopped", hash: "h" });
   cli.failDelete.add("old");
-  await assertRejects(() => run(cli, "pruneContainers", { apply: true }));
+  cli.containers.set("gone", { state: "stopped", hash: "h" });
+  const e = await assertRejects(
+    () => run(cli, "pruneContainers", { apply: true }),
+    Error,
+    "deleted [gone]",
+  );
+  assertStringIncludes(e.message, "old (container delete old failed");
+});
+
+Deno.test("a replacement that cannot be created leaves the old one running", async () => {
+  const cli = new Cli();
+  await run(cli, "ensure", SPEC);
+  cli.failCreate = true;
+  await assertRejects(
+    () => run(cli, "ensure", { ...SPEC, cpus: 2, replace: "drift" }),
+    Error,
+    "manifest not found",
+  );
+  assertEquals(cli.containers.get("web")!.state, "running");
+});
+
+Deno.test("staging: leaves nothing, clears a leftover, spares a lookalike", async () => {
+  const cli = new Cli();
+  await run(cli, "ensure", SPEC);
+  const change = { ...SPEC, cpus: 2, replace: "drift" };
+  cli.containers.set(stagingName("web"), { state: "stopped", hash: "h" });
+  await assertRejects(() => run(cli, "ensure", change), Error, "not a stopped");
+  assertEquals(cli.containers.size, 2);
+  cli.containers.get(stagingName("web"))!.staging = "web";
+  await run(cli, "ensure", change);
+  assertEquals([...cli.containers.keys()], ["web"]);
+  assert(stagingName("x".repeat(63)).length <= 63);
+});
+
+Deno.test("a changed secret value is drift, and is not stored", async () => {
+  const cli = new Cli();
+  const withSecret = (T: string) => ({ ...SPEC, secretEnv: { T } });
+  await run(cli, "ensure", withSecret("one"));
+  const [same] = await run(cli, "ensure", withSecret("one"));
+  assertEquals(same.data.action, "unchanged");
+  await assertRejects(
+    () => run(cli, "ensure", withSecret("two")),
+    Error,
+    "differs",
+  );
+  const [w] = await run(cli, "ensure", {
+    ...withSecret("rotated-value"),
+    replace: "drift",
+  });
+  assertEquals(w.data.action, "replaced");
+  assertFalse(JSON.stringify(w).includes("rotated-value"));
+});
+
+Deno.test("anonymous volumes are rejected", () => {
+  assertThrows(() => spec({ volumes: ["/data"] }));
+  spec({ volumes: ["data:/data:ro"] });
+});
+
+Deno.test("image instances do not collide", async () => {
+  assert(await imageInstance("a/b:c") !== await imageInstance("a-b:c"));
+  assertEquals(await imageInstance("a/b"), await imageInstance("a/b"));
 });
 
 // --- exec, logs, stats --------------------------------------------------------
@@ -445,6 +525,93 @@ Deno.test("exec redacts, and fails unless allowFailure", async () => {
   const [w] = await run(cli, "exec", { ...input, allowFailure: true });
   assertEquals(w.data.exitCode, 3);
   assertEquals(w.data.stdout, "got ***");
+});
+
+const CLI_ERROR =
+  "Error: failed to find target executable /x\nError: failed to start process " +
+  "8df66bda-f404-45f1-a77b-f7734476eb60 in container web (cause: ...)";
+
+Deno.test("allowFailure does not record the CLI's own failure", async () => {
+  assert(isExecCliError({ code: 1, stdout: "", stderr: CLI_ERROR }));
+  assertFalse(isExecCliError({ code: 1, stdout: "", stderr: "Error: mine" }));
+  const cli = new Cli();
+  await run(cli, "ensure", SPEC);
+  cli.execResult = { code: 1, stdout: "", stderr: CLI_ERROR };
+  await assertRejects(
+    () =>
+      run(cli, "exec", { name: "web", command: ["/x"], allowFailure: true }),
+    Error,
+    "could not run",
+  );
+});
+
+Deno.test("a failing command's output is in the error, redacted", async () => {
+  const cli = new Cli();
+  await run(cli, "ensure", SPEC);
+  cli.execResult = { code: 2, stdout: `o ${SECRET}`, stderr: "why" };
+  const e = await assertRejects(
+    () =>
+      run(cli, "exec", {
+        name: "web",
+        command: ["x"],
+        secretEnv: { T: SECRET },
+      }),
+    Error,
+  );
+  assertStringIncludes(e.message, "stderr: why stdout: o ***");
+});
+
+Deno.test("a forced timeout kills what exec left behind, or says it could not", async () => {
+  for (
+    const [left, want] of [["left=0", "was killed"], [
+      "left=1",
+      "may still run",
+    ]]
+  ) {
+    const cli = new Cli();
+    await run(cli, "ensure", SPEC);
+    const answer = cli.answer.bind(cli);
+    let marker = "";
+    cli.answer = (a, o) => {
+      if (a[0] !== "exec") return answer(a, o);
+      if (a.includes("sh")) {
+        assertEquals(a[a.length - 1], marker);
+        return { code: 0, stdout: `${left}\n`, stderr: "" };
+      }
+      marker = a.find((x) => x.startsWith("--env=SWAMP_EXEC_ID="))!.slice(6);
+      throw new Interrupted("container exec timed out", false);
+    };
+    await assertRejects(
+      () => run(cli, "exec", { name: "web", command: ["x"] }),
+      Error,
+      want,
+    );
+  }
+});
+
+Deno.test({
+  name: "the runner sends TERM, then KILL, and honours cancellation",
+  ignore: (await Deno.permissions.query({ name: "run" })).state !== "granted",
+  fn: async () => {
+    const go = (script: string, timeoutMs: number, signal?: AbortSignal) =>
+      spawnRunner("/bin/sh", ["-c", script], { timeoutMs, signal });
+    const soft = await assertRejects(
+      () => go("exec sleep 30", 200),
+      Interrupted,
+    );
+    assert(soft.graceful);
+    const hard = await assertRejects(
+      () => go("trap '' TERM; while :; do :; done", 200),
+      Interrupted,
+    );
+    assertFalse(hard.graceful);
+    await assertRejects(
+      () => go("exec sleep 30", 60_000, AbortSignal.timeout(200)),
+      Interrupted,
+      "cancelled",
+    );
+    assertEquals((await go("echo hi", 5_000)).stdout, "hi\n");
+  },
 });
 
 Deno.test("allowFailure does not hide a missing container", async () => {

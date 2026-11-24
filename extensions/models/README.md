@@ -52,16 +52,17 @@ swamp model create @sntxrr/apple-container mac \
 A hash of the spec is stored in a label on the container.
 
 - **Same hash:** start it if stopped, otherwise do nothing.
-- **Different hash:** fail, unless `replace` is `drift` or `always`. Replacing
-  loses the container's root filesystem; named volumes survive. The old
-  container is deleted before the new one is created, so pull a new image first.
+- **Different hash, or a changed secret value:** fail, unless `replace` is
+  `drift` or `always`. The replacement is first created as a stopped copy, so a
+  bad image, network or option fails while the old container still runs.
+  Replacing loses the root filesystem; named volumes survive.
 - **No label:** fail. A container made by something else is never changed.
 
 After starting, it waits `settleSeconds` and fails if the container has exited.
 
-The hash covers secret names but not values, so after rotating a secret run
-`ensure` with `replace=always`. An existing volume or network is matched by name
-only. Apple's CLI has no restart policy; schedule `ensure` instead.
+Secret values are compared with the running container in memory, and are not
+hashed or stored. An existing volume or network is matched by name only. Apple's
+CLI has no restart policy; schedule `ensure` instead.
 
 ## What is and is not stored
 
@@ -72,7 +73,12 @@ arguments. This model stores neither, nor label values or host mount paths.
 of its argv, and are redacted from captured output and errors. The container
 itself still holds them: anyone who can run `container inspect` can read them.
 
-`exec` and `logs` store what the container prints, for 7 days.
+`exec` and `logs` store what the container prints, for 7 days. A failed `exec`
+stores nothing unless `allowFailure` is set; its output is in the error.
+
+On timeout, `exec` sends SIGTERM to the command. Each command also gets a
+`SWAMP_EXEC_ID` variable, used to find it again. One that ignores it is killed
+if the container has `sh` and `grep`; otherwise the error says it may still run.
 
 ## Not included
 
