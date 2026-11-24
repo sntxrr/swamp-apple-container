@@ -1,0 +1,24 @@
+manifestVersion: 1
+
+name: "@sntxrr/apple-container"
+version: "2026.11.24.1"
+description: "Manage containers on a Mac with Apple's container CLI (https://github.com/apple/container). Records containers, images, volumes, networks, disk usage and stats; keeps a container at a desired spec (create, start, detect drift, replace on request); runs commands, reads logs, and starts or stops the service. It stores no environment variables, arguments or label values, keeps secret environment out of argv, refuses to change containers it did not create, and prunes as a dry run by default. For image build, push and registry login use @swamp/container-image."
+repository: "https://github.com/sntxrr/swamp-apple-container"
+license: MIT
+
+models:
+  - apple_container.ts
+
+additionalFiles:
+  - README.md
+  - LICENSE.md
+
+platforms:
+  - darwin-aarch64
+
+labels:
+  - apple-container
+  - containers
+  - macos
+  - apple-silicon
+  - virtualization
